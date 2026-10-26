@@ -1,6 +1,6 @@
 <#
 Update-CheckmkAgent.ps1 - in-place update of the Checkmk Windows agent from the Checkmk site.
-Checkmk Community (Raw) has no built-in agent updater; this fills the gap. BCT / MSP Bergin CT.
+Checkmk Community (Raw) has no built-in agent updater; this fills the gap. DX / MSP Bergin CT.
 
 Runs under Windows PowerShell 5.1 (Server 2012 R2 - 2025) and pwsh 7, elevated or as SYSTEM.
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Update-CheckmkAgent.ps1 [-DryRun] [-Force]
@@ -21,33 +21,39 @@ Exit codes (RMM / N-central):
   3 = updated, reboot required (msiexec 3010/1641)
   4 = -DryRun only: an update is available (nothing changed)
 
-Logs: transcript + msiexec verbose log in C:\BCT\Logs (-LogDir).
-Server 2016 and older: use the LAN http base (default). The public https site is TLS 1.3-only.
+Logs: transcript + msiexec verbose log in C:\DX\Logs (-LogDir).
+Default base is the public site https://mon.ausict.com/dx (Cloudflare, TLS 1.3 only). Windows only has
+TLS 1.3 from Server 2022 / Windows 11, so Server 2012 R2 / 2016 / 2019 must use a LAN http base:
+  -BaseUrl http://10.23.23.21/dx
+-InstallScheduledTask also removes the old task \BCT\BCT Checkmk Agent Update (migration); C:\BCT\ folders are left alone.
 No secrets in this file. Env vars CMK_TEST_* are test-only and honoured only with -DryRun.
 #>
 [CmdletBinding()]
 param(
-    [string]$BaseUrl = '',            # default http://10.23.23.21/dx (env CMK_BASEURL)
+    [string]$BaseUrl = '',            # default https://mon.ausict.com/dx (env CMK_BASEURL)
     [string]$TargetVersion = '',      # e.g. 2.5.0p17 - skips discovery (env CMK_TARGET_VERSION)
     [string]$MsiUrl = '',             # override MSI URL (env CMK_MSI_URL)
     [switch]$Force,                   # reinstall even if not newer (env CMK_FORCE=1)
     [switch]$DryRun,                  # report only, change nothing (env CMK_DRYRUN=1)
     [switch]$InstallIfMissing,        # install fresh if no agent present (env CMK_INSTALL_IF_MISSING=1)
-    [switch]$InstallScheduledTask,    # save script to C:\BCT\Scripts and register weekly SYSTEM task
+    [switch]$InstallScheduledTask,    # save script to C:\DX\Scripts and register weekly SYSTEM task
     [ValidateSet('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')]
     [string]$TaskDay = 'Tuesday',
     [string]$TaskTime = '03:00',      # local time HH:mm, task gets up to 30 min random delay
     [string]$ScriptUrl = '',          # optional: where the task copy is downloaded from if no local text
-    [string]$ScriptDir = 'C:\BCT\Scripts',
-    [string]$LogDir = 'C:\BCT\Logs'
+    [string]$ScriptDir = 'C:\DX\Scripts',
+    [string]$LogDir = 'C:\DX\Logs'
 )
 
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference    = 'SilentlyContinue'
     $Tag      = '[cmk-update]'
-    $TaskName = 'BCT Checkmk Agent Update'
-    $state    = @{ TranscriptOn = $false }   # block-local, so nothing leaks into an irm|iex session
+    $TaskName = 'DX Checkmk Agent Update'
+    $TaskPath = '\DX\'
+    $OldTaskName = 'BCT Checkmk Agent Update'   # migration: pre-rename task, removed by -InstallScheduledTask
+    $OldTaskPath = '\BCT\'
+    $state    = @{ TranscriptOn = $false; TlsHinted = $false }   # block-local, so nothing leaks into an irm|iex session
 
     function Log([string]$Msg, [string]$Level = 'INFO') {
         $line = '{0} {1} {2,-5} {3}' -f $Tag, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Msg
@@ -153,7 +159,7 @@ param(
         try {
             $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60
         } catch {
-            Log "agents listing $url not readable: $($_.Exception.Message)" 'WARN'; return ''
+            Log "agents listing $url not readable: $($_.Exception.Message)" 'WARN'; Write-TlsHint $url; return ''
         }
         $found = [regex]::Matches([string]$resp.Content, 'check-mk-agent_([0-9][0-9A-Za-z.+~]*)-\d+_all\.deb') |
                  ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
@@ -218,10 +224,11 @@ param(
         if ($TargetVersion)    { $argList += " -TargetVersion `"$TargetVersion`"" }
         if ($msiExplicit)      { $argList += " -MsiUrl `"$MsiUrl`"" }
         if ($InstallIfMissing) { $argList += ' -InstallIfMissing' }
-        if ($LogDir -ne 'C:\BCT\Logs') { $argList += " -LogDir `"$LogDir`"" }
+        if ($LogDir -ne 'C:\DX\Logs') { $argList += " -LogDir `"$LogDir`"" }
         if ($DryRun) {
             Log "DRY RUN: would save script to $target and register task '$TaskName' weekly $TaskDay $TaskTime as SYSTEM"
             Log "DRY RUN: action powershell.exe $argList"
+            Invoke-OldTaskCleanup
             return
         }
         New-Item -Path $ScriptDir -ItemType Directory -Force | Out-Null
@@ -234,14 +241,52 @@ param(
             $trigger   = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $TaskDay -At $at -RandomDelay (New-TimeSpan -Minutes 30)
             $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
             $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-            Register-ScheduledTask -TaskName $TaskName -TaskPath '\BCT\' -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+            Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
                 -Description 'Weekly in-place update of the Checkmk agent from the Checkmk site (Update-CheckmkAgent.ps1)' -Force | Out-Null
         } else {
             $day = $TaskDay.Substring(0, 3).ToUpper()
-            & schtasks.exe /Create /F /RU SYSTEM /RL HIGHEST /SC WEEKLY /D $day /ST $TaskTime /TN "\BCT\$TaskName" /TR "`"$psExe`" $argList" | Out-Null
+            & schtasks.exe /Create /F /RU SYSTEM /RL HIGHEST /SC WEEKLY /D $day /ST $TaskTime /TN "$TaskPath$TaskName" /TR "`"$psExe`" $argList" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "schtasks.exe failed ($LASTEXITCODE)" }
         }
-        Log "registered scheduled task \BCT\$TaskName (weekly $TaskDay $TaskTime +0-30 min, SYSTEM)"
+        Log "registered scheduled task $TaskPath$TaskName (weekly $TaskDay $TaskTime +0-30 min, SYSTEM)"
+        Invoke-OldTaskCleanup
+    }
+
+    # Migration: remove the pre-rename task \BCT\BCT Checkmk Agent Update if present (respects -DryRun).
+    # Old C:\BCT\Scripts / C:\BCT\Logs files are deliberately left in place.
+    function Invoke-OldTaskCleanup {
+        $old = "$OldTaskPath$OldTaskName"
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            $t = Get-ScheduledTask -TaskPath $OldTaskPath -TaskName $OldTaskName -ErrorAction SilentlyContinue
+            if (-not $t) { Log "old task $old not present"; return }
+            if ($DryRun) { Log "DRY RUN: would remove old task $old"; return }
+            Unregister-ScheduledTask -TaskPath $OldTaskPath -TaskName $OldTaskName -Confirm:$false
+            Log "removed old task $old (C:\BCT\ files left in place; delete manually if wanted)"
+        } elseif (Get-Command schtasks.exe -ErrorAction SilentlyContinue) {
+            & schtasks.exe /Query /TN $old 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { Log "old task $old not present"; return }
+            if ($DryRun) { Log "DRY RUN: would remove old task $old"; return }
+            & schtasks.exe /Delete /F /TN $old | Out-Null
+            if ($LASTEXITCODE -ne 0) { Log "could not remove old task $old (schtasks $LASTEXITCODE)" 'WARN'; return }
+            Log "removed old task $old (C:\BCT\ files left in place; delete manually if wanted)"
+        } else {
+            Log "old task ${old}: no task scheduler tools found, skipped" 'WARN'
+        }
+    }
+
+    # Cloudflare in front of mon.ausict.com only accepts TLS 1.3, which Windows only has from build 20348
+    # (Server 2022 / Windows 11). Older builds must use a LAN http base URL.
+    function Write-TlsHint([string]$Url) {
+        if ($Url -notlike 'https:*' -or $state.TlsHinted) { return }
+        $state.TlsHinted = $true
+        $os = [Environment]::OSVersion
+        if ($os.Platform -eq 'Win32NT' -and $os.Version.Build -lt 20348) {
+            $msg = ("HTTPS to $Url failed. This OS (build {0}; Server 2012 R2/2016/2019) has no TLS 1.3, which the public site requires. " +
+                    "Use the LAN http URL instead: -BaseUrl http://10.23.23.21/dx") -f $os.Version.Build
+            Log $msg 'WARN'
+        } else {
+            Log "HTTPS to $Url failed. If the public site is unreachable from here, use the LAN http URL: -BaseUrl http://10.23.23.21/dx" 'WARN'
+        }
     }
 
     function Wait-AgentService {
@@ -266,7 +311,7 @@ param(
         $testMode = $false
         # ----- resolve settings: parameter > CMK_* env var > default -----
         if (-not $BaseUrl)       { $BaseUrl = $env:CMK_BASEURL }
-        if (-not $BaseUrl)       { $BaseUrl = 'http://10.23.23.21/dx' }
+        if (-not $BaseUrl)       { $BaseUrl = 'https://mon.ausict.com/dx' }
         $BaseUrl = $BaseUrl.TrimEnd('/')
         if (-not $TargetVersion) { $TargetVersion = $env:CMK_TARGET_VERSION }
         if (-not $MsiUrl)        { $MsiUrl = $env:CMK_MSI_URL }
@@ -290,7 +335,18 @@ param(
         } else {
             Log 'TEST MODE (CMK_TEST_SKIP_ADMIN + DryRun): admin check, transcript and Windows probes skipped' 'WARN'
         }
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        # TLS 1.2 always; TLS 1.3 only where the enum exists (.NET 4.8+) AND the OS supports it (build >= 20348).
+        # Setting Tls13 on older Schannel can break the handshake for every protocol, so it is not forced there.
+        $proto = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try {
+            $osv = [Environment]::OSVersion
+            if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13' -and
+                ($osv.Platform -ne 'Win32NT' -or $osv.Version.Build -ge 20348)) {
+                $proto = $proto -bor [Net.SecurityProtocolType]'Tls13'
+            }
+        } catch { Log "TLS 1.3 not available in this .NET: $($_.Exception.Message)" 'WARN' }
+        [Net.ServicePointManager]::SecurityProtocol = $proto
+        Log "SecurityProtocol: $([Net.ServicePointManager]::SecurityProtocol)"
         if ($DryRun) { Log 'DRY RUN - nothing will be changed' }
         Log "base $BaseUrl"
 
@@ -381,7 +437,12 @@ param(
         Done 0 "updated to $srcVer"
     }
     catch {
-        Done 1 $_.Exception.Message
+        $em = $_.Exception.Message
+        if ($em -match '(?i)connect|SSL|TLS|secure channel|underlying connection|establish trust|handshake') {
+            Write-TlsHint $BaseUrl
+            if ($MsiUrl) { Write-TlsHint $MsiUrl }
+        }
+        Done 1 $em
     }
     finally {
         if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
