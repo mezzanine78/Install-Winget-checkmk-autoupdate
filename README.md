@@ -9,7 +9,7 @@ Provisions winget (App Installer) for **all users**, using the latest
 Built for RMM jobs running as SYSTEM in Windows PowerShell 5.1. Also works elevated in pwsh.
 
 ```powershell
-irm https://raw.githubusercontent.com/mezzanine78/windows-tools/main/Install-Winget.ps1 | iex
+irm https://raw.githubusercontent.com/mezzanine78/Install-Winget.ps1/main/Install-Winget.ps1 | iex
 ```
 
 - Needs Administrator or SYSTEM; otherwise it stops with exit code 1.
@@ -24,16 +24,16 @@ Updates the Checkmk Windows agent in place when the Checkmk site offers a newer 
 
 ```powershell
 # Dry run (check only)
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mezzanine78/windows-tools/main/Update-CheckmkAgent.ps1))) -DryRun
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mezzanine78/Install-Winget.ps1/main/Update-CheckmkAgent.ps1))) -DryRun
 
 # Update now
-irm https://raw.githubusercontent.com/mezzanine78/windows-tools/main/Update-CheckmkAgent.ps1 | iex
+irm https://raw.githubusercontent.com/mezzanine78/Install-Winget.ps1/main/Update-CheckmkAgent.ps1 | iex
 
 # Install the weekly SYSTEM scheduled task (Tuesdays 03:00)
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mezzanine78/windows-tools/main/Update-CheckmkAgent.ps1))) -InstallScheduledTask
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mezzanine78/Install-Winget.ps1/main/Update-CheckmkAgent.ps1))) -InstallScheduledTask
 ```
 
-Parameters: `-BaseUrl` (default `http://10.23.23.21/dx`), `-DryRun`, `-Force`, `-TargetVersion`, `-InstallIfMissing`, `-InstallScheduledTask`.
+Parameters: `-BaseUrl` (default `https://mon.ausict.com/dx`), `-DryRun`, `-Force`, `-TargetVersion`, `-InstallIfMissing`, `-InstallScheduledTask`.
 Exit codes: 0 up to date/updated, 1 error, 2 agent not installed, 3 updated (reboot needed), 4 dry run found an update.
 
 Files: the task's copy of the script goes to `C:\Windows\Scripts\DX\Scripts`, logs to `C:\Windows\Scripts\DX\Logs`
