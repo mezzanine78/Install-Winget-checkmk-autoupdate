@@ -35,3 +35,12 @@ irm https://raw.githubusercontent.com/mezzanine78/windows-tools/main/Update-Chec
 
 Parameters: `-BaseUrl` (default `http://10.23.23.21/dx`), `-DryRun`, `-Force`, `-TargetVersion`, `-InstallIfMissing`, `-InstallScheduledTask`.
 Exit codes: 0 up to date/updated, 1 error, 2 agent not installed, 3 updated (reboot needed), 4 dry run found an update.
+
+Files: the task's copy of the script goes to `C:\Windows\Scripts\DX\Scripts`, logs to `C:\Windows\Scripts\DX\Logs`
+(built from `%SystemRoot%`; folders get SYSTEM + Administrators full control only). Anything given under the old
+`C:\DX` root is mapped to the same place under `C:\Windows\Scripts\DX`.
+Re-running `-InstallScheduledTask` on a machine set up with the old `C:\DX` paths re-points the task
+`\DX\DX Checkmk Agent Update` at the new copy, copies the old logs across, then deletes only this script's own
+files under `C:\DX` and any folders left empty. `C:\DX` itself stays if anything else is in it.
+
+Tests: `Invoke-Pester ./tests` (Pester 5, runs on pwsh; Windows cmdlets are faked).

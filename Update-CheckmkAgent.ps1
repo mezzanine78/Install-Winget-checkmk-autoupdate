@@ -21,7 +21,14 @@ Exit codes (RMM / N-central):
   3 = updated, reboot required (msiexec 3010/1641)
   4 = -DryRun only: an update is available (nothing changed)
 
-Logs: transcript + msiexec verbose log in C:\DX\Logs (-LogDir).
+Files: task copy of this script in C:\Windows\Scripts\DX\Scripts, transcript + msiexec verbose log in
+C:\Windows\Scripts\DX\Logs (-ScriptDir / -LogDir; built from %SystemRoot%). New folders there get SYSTEM +
+Administrators full control only (SIDs, inheritance protected). A -ScriptDir / -LogDir under the old C:\DX root
+is mapped to the same place under C:\Windows\Scripts\DX.
+-InstallScheduledTask migrates an old C:\DX install: copies this script's logs from C:\DX\Logs, re-points the
+task \DX\DX Checkmk Agent Update at the new copy, and only once the task is confirmed on the new path deletes
+the files this script owns under C:\DX (its script copy and its logs) and any of those folders left empty.
+C:\DX itself is removed only if it is empty (other DX tools may live there).
 Default base is the public site https://mon.ausict.com/dx (Cloudflare, TLS 1.3 only). Windows only has
 TLS 1.3 from Server 2022 / Windows 11, so Server 2012 R2 / 2016 / 2019 must use a LAN http base:
   -BaseUrl http://10.23.23.21/dx
@@ -36,13 +43,13 @@ param(
     [switch]$Force,                   # reinstall even if not newer (env CMK_FORCE=1)
     [switch]$DryRun,                  # report only, change nothing (env CMK_DRYRUN=1)
     [switch]$InstallIfMissing,        # install fresh if no agent present (env CMK_INSTALL_IF_MISSING=1)
-    [switch]$InstallScheduledTask,    # save script to C:\DX\Scripts and register weekly SYSTEM task
+    [switch]$InstallScheduledTask,    # save script to C:\Windows\Scripts\DX\Scripts and register weekly SYSTEM task
     [ValidateSet('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')]
     [string]$TaskDay = 'Tuesday',
     [string]$TaskTime = '03:00',      # local time HH:mm, task gets up to 30 min random delay
     [string]$ScriptUrl = '',          # optional: where the task copy is downloaded from if no local text
-    [string]$ScriptDir = 'C:\DX\Scripts',
-    [string]$LogDir = 'C:\DX\Logs'
+    [string]$ScriptDir = '',          # default %SystemRoot%\Scripts\DX\Scripts (C:\Windows\Scripts\DX\Scripts)
+    [string]$LogDir = ''              # default %SystemRoot%\Scripts\DX\Logs
 )
 
 & {
@@ -53,6 +60,11 @@ param(
     $TaskPath = '\DX\'
     $OldTaskName = 'BCT Checkmk Agent Update'   # migration: pre-rename task, removed by -InstallScheduledTask
     $OldTaskPath = '\BCT\'
+    # File root: C:\Windows\Scripts\DX (follows %SystemRoot%). Before 2026-10-31 it was C:\DX (migrated by -InstallScheduledTask).
+    $DxRoot     = if ($env:SystemRoot) { Join-Path $env:SystemRoot 'Scripts\DX' } else { 'C:\Windows\Scripts\DX' }
+    $LegacyRoot = 'C:\DX'
+    $ScriptFileName  = 'Update-CheckmkAgent.ps1'
+    $OwnedLogPattern = '^(Update-CheckmkAgent|CheckmkAgent)-\d{8}-\d{6}\.log$'   # the only log names this script writes
     $state    = @{ TranscriptOn = $false; TlsHinted = $false }   # block-local, so nothing leaks into an irm|iex session
 
     function Log([string]$Msg, [string]$Level = 'INFO') {
@@ -114,13 +126,6 @@ param(
             if ($x.$p -gt $y.$p) { return 1 }
         }
         return 0
-    }
-
-    # Expose helpers for unit tests (test-only, never used in normal runs).
-    if ($env:CMK_TEST_EXPORT_FUNCTIONS -eq '1') {
-        Set-Item -Path 'function:global:ConvertTo-CmkVersion' -Value ${function:ConvertTo-CmkVersion}
-        Set-Item -Path 'function:global:Compare-CmkVersion' -Value ${function:Compare-CmkVersion}
-        return
     }
 
     function Get-InstalledAgent {
@@ -217,21 +222,28 @@ param(
     }
 
     function Install-Task {
-        $target = [IO.Path]::Combine($ScriptDir, 'Update-CheckmkAgent.ps1')
+        $target = [IO.Path]::Combine($ScriptDir, $ScriptFileName)
         $txt = Get-ScriptText
         Log "script text for the task copy: $($txt.Length) chars"
         $argList = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$target`" -BaseUrl `"$BaseUrl`""
         if ($TargetVersion)    { $argList += " -TargetVersion `"$TargetVersion`"" }
         if ($msiExplicit)      { $argList += " -MsiUrl `"$MsiUrl`"" }
         if ($InstallIfMissing) { $argList += ' -InstallIfMissing' }
-        if ($LogDir -ne 'C:\DX\Logs') { $argList += " -LogDir `"$LogDir`"" }
+        if (-not (Test-DXSamePath $LogDir ([IO.Path]::Combine($DxRoot, 'Logs')))) { $argList += " -LogDir `"$LogDir`"" }
+        $before = Get-DXTaskAction $TaskPath $TaskName
+        $legacy = Get-DXLegacyLocation $before
+        if ($before -and (Test-DXTextHasPath $before $LegacyRoot -AsFolder)) { Log "task $TaskPath$TaskName runs from the old root $LegacyRoot; re-pointing it to $target" }
         if ($DryRun) {
             Log "DRY RUN: would save script to $target and register task '$TaskName' weekly $TaskDay $TaskTime as SYSTEM"
             Log "DRY RUN: action powershell.exe $argList"
+            Copy-DXLegacyLog $legacy -DryRun
+            Invoke-DXLegacyCleanup $legacy $target -DryRun
             Invoke-OldTaskCleanup
             return
         }
-        New-Item -Path $ScriptDir -ItemType Directory -Force | Out-Null
+        Initialize-DXFolder $ScriptDir -Reprotect
+        Initialize-DXFolder $LogDir -Reprotect
+        Copy-DXLegacyLog $legacy
         [IO.File]::WriteAllText($target, $txt, (New-Object Text.UTF8Encoding($true)))
         Log "saved script to $target ($((Get-Item -LiteralPath $target).Length) bytes)"
         $at = [datetime]::ParseExact($TaskTime, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
@@ -249,7 +261,168 @@ param(
             if ($LASTEXITCODE -ne 0) { throw "schtasks.exe failed ($LASTEXITCODE)" }
         }
         Log "registered scheduled task $TaskPath$TaskName (weekly $TaskDay $TaskTime +0-30 min, SYSTEM)"
+        # Old C:\DX files are only removed once the task is confirmed to run the new copy.
+        $after = Get-DXTaskAction $TaskPath $TaskName
+        if ($after -and (Test-DXTextHasPath $after $target)) {
+            Log "task action confirmed: $target"
+            Invoke-DXLegacyCleanup $legacy $target
+        } elseif ($legacy.Found) {
+            Log "could not confirm the task runs $target; old files under $LegacyRoot left in place" 'WARN'
+        }
         Invoke-OldTaskCleanup
+    }
+
+    # ---------- C:\DX -> C:\Windows\Scripts\DX ----------
+    function ConvertTo-DXNormPath([string]$Path) { return ([string]$Path).Replace('/', '\').TrimEnd('\').ToUpperInvariant() }
+    function Test-DXSamePath([string]$A, [string]$B) { return ((ConvertTo-DXNormPath $A) -eq (ConvertTo-DXNormPath $B)) }
+    function Test-DXUnderPath([string]$Path, [string]$Root) {
+        # $Path is $Root itself or inside it (case-insensitive, / or \).
+        $p = ConvertTo-DXNormPath $Path; $r = ConvertTo-DXNormPath $Root
+        if (-not $p -or -not $r) { return $false }
+        return ($p -eq $r -or $p.StartsWith($r + '\'))
+    }
+    function Test-DXTextHasPath([string]$Text, [string]$Path, [switch]$AsFolder) {
+        # $Text (task action / XML) mentions $Path (-AsFolder: something inside folder $Path; C:\DX must not match C:\DXTools).
+        if (-not $Text -or -not $Path) { return $false }
+        $n = ConvertTo-DXNormPath $Path
+        if ($AsFolder) { $n += '\' }
+        return ($Text.Replace('/', '\').ToUpperInvariant().Contains($n))
+    }
+    function Resolve-DXPath([string]$Value, [string]$Default) {
+        # '' -> default; anything under the old C:\DX root -> same place under the new root; else unchanged.
+        if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
+        $v = $Value.Trim()
+        if (Test-DXUnderPath $v $LegacyRoot) {
+            $rest = $v.Replace('/', '\').TrimEnd('\').Substring($LegacyRoot.TrimEnd('\').Length).TrimStart('\')
+            $n = $DxRoot
+            if ($rest) { $n = $DxRoot.TrimEnd('\') + '\' + $rest }
+            Log "$v is under the old root $LegacyRoot; using $n"
+            return $n
+        }
+        return $v
+    }
+
+    function Protect-DXFolder([string]$Path) {
+        # SYSTEM (S-1-5-18) + BUILTIN\Administrators (S-1-5-32-544) full control, inheritance from C:\Windows removed.
+        # SIDs, not names, so it works on non-English Windows. Same as the other DX tools under C:\Windows\Scripts\DX.
+        try {
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+            $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+            foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+                $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', $inherit,
+                                [System.Security.AccessControl.PropagationFlags]::None, 'Allow')))
+            }
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        } catch { Log "could not set SYSTEM/Administrators ACL on ${Path}: $($_.Exception.Message)" 'WARN' }
+    }
+
+    function Initialize-DXFolder([string]$Path, [switch]$Reprotect) {
+        # Creates $Path. Folders under C:\Windows\Scripts\DX (and that root) get the SYSTEM/Administrators ACL when
+        # created, or always with -Reprotect (-InstallScheduledTask). Custom folders elsewhere are left as they are.
+        $under = Test-DXUnderPath $Path $DxRoot
+        $dirs = @()
+        if ($under -and -not (Test-DXSamePath $Path $DxRoot)) { $dirs += $DxRoot }
+        $dirs += $Path
+        foreach ($d in $dirs) {
+            $created = $false
+            if (-not (Test-Path -LiteralPath $d)) { New-Item -Path $d -ItemType Directory -Force | Out-Null; $created = $true }
+            if ($under -and ($created -or $Reprotect)) { Protect-DXFolder $d }
+        }
+    }
+
+    function Get-DXTaskAction([string]$Path, [string]$Name) {
+        # Action of the existing task ("exe args", or the task XML via schtasks), '' if there is no task.
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            $t = Get-ScheduledTask -TaskPath $Path -TaskName $Name -ErrorAction SilentlyContinue
+            if (-not $t) { return '' }
+            return (@($t.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' ')
+        }
+        if (Get-Command schtasks.exe -ErrorAction SilentlyContinue) {
+            $xml = & schtasks.exe /Query /TN "$Path$Name" /XML 2>$null
+            if ($LASTEXITCODE -ne 0) { return '' }
+            return (@($xml) -join "`n")
+        }
+        return ''
+    }
+
+    function Get-DXLegacyLocation([string]$TaskAction) {
+        # Folders under C:\DX that may hold this script's files: the old defaults C:\DX\Scripts and C:\DX\Logs, plus
+        # the -File folder / -LogDir of the existing task if those are under C:\DX.
+        $sd = @([IO.Path]::Combine($LegacyRoot, 'Scripts')); $ld = @([IO.Path]::Combine($LegacyRoot, 'Logs'))
+        if ($TaskAction) {
+            $a = $TaskAction.Replace('&quot;', '"')
+            if ($a -match '-File\s+"([^"]+)"' -and (Test-DXUnderPath $Matches[1] $LegacyRoot)) { $sd += (Split-Path -Parent $Matches[1]) }
+            if ($a -match '-LogDir\s+"([^"]+)"' -and (Test-DXUnderPath $Matches[1] $LegacyRoot)) { $ld += $Matches[1] }
+        }
+        $sd = @($sd | Where-Object { Test-Path -LiteralPath $_ } | Sort-Object -Unique)
+        $ld = @($ld | Where-Object { Test-Path -LiteralPath $_ } | Sort-Object -Unique)
+        $found = $false
+        foreach ($d in $sd) { if (Test-Path -LiteralPath ([IO.Path]::Combine($d, $ScriptFileName))) { $found = $true } }
+        foreach ($d in $ld) { if (@(Get-DXOwnedLog $d).Count) { $found = $true } }
+        if ($TaskAction -and (Test-DXTextHasPath $TaskAction $LegacyRoot -AsFolder)) { $found = $true }
+        return [pscustomobject]@{ Found = $found; ScriptDirs = $sd; LogDirs = $ld }
+    }
+
+    function Get-DXOwnedLog([string]$Dir) {
+        if (-not (Test-Path -LiteralPath $Dir)) { return @() }
+        return @(Get-ChildItem -LiteralPath $Dir -File -Force | Where-Object { $_.Name -match $OwnedLogPattern })
+    }
+
+    function Copy-DXLegacyLog($Legacy, [switch]$DryRun) {
+        # Copies this script's old logs to the new log folder (never overwrites a file already there).
+        foreach ($d in $Legacy.LogDirs) {
+            if (Test-DXSamePath $d $LogDir) { continue }
+            $n = 0
+            foreach ($f in @(Get-DXOwnedLog $d)) {
+                $dst = [IO.Path]::Combine($LogDir, $f.Name)
+                if (Test-Path -LiteralPath $dst) { continue }
+                if (-not $DryRun) { Copy-Item -LiteralPath $f.FullName -Destination $dst }
+                $n++
+            }
+            if ($n) {
+                if ($DryRun) { Log "DRY RUN: would copy $n old log(s) from $d to $LogDir" }
+                else { Log "migration: copied $n old log(s) from $d to $LogDir" }
+            }
+        }
+    }
+
+    function Invoke-DXLegacyCleanup($Legacy, [string]$Target, [switch]$DryRun) {
+        # Deletes ONLY this script's files under C:\DX: its script copy and its logs (a log only once a copy exists in
+        # the new log folder), then those folders and C:\DX itself if they are empty. Anything else stays.
+        if (-not $Legacy.Found) { return }
+        $pre = 'removed'; if ($DryRun) { $pre = 'DRY RUN: would remove' }
+        try {
+            foreach ($d in $Legacy.ScriptDirs) {
+                $f = [IO.Path]::Combine($d, $ScriptFileName)
+                if ((Test-Path -LiteralPath $f) -and -not (Test-DXSamePath $f $Target)) {
+                    if (-not $DryRun) { Remove-Item -LiteralPath $f -Force }
+                    Log "$pre old script copy $f"
+                }
+            }
+            foreach ($d in $Legacy.LogDirs) {
+                if (Test-DXSamePath $d $LogDir) { continue }
+                $n = 0; $kept = 0
+                foreach ($f in @(Get-DXOwnedLog $d)) {
+                    if ($DryRun -or (Test-Path -LiteralPath ([IO.Path]::Combine($LogDir, $f.Name)))) {
+                        if (-not $DryRun) { Remove-Item -LiteralPath $f.FullName -Force }
+                        $n++
+                    } else { $kept++ }
+                }
+                if ($n) { Log "$pre $n old log(s) from $d (copied to $LogDir)" }
+                if ($kept) { Log "kept $kept old log(s) in $d (no copy in $LogDir)" 'WARN' }
+            }
+            if ($DryRun) { Log "DRY RUN: would then remove those folders and $LegacyRoot only if empty"; return }
+            $dirs = @(@($Legacy.ScriptDirs) + @($Legacy.LogDirs) | Select-Object -Unique | Sort-Object { $_.Length } -Descending)
+            foreach ($d in @($dirs + $LegacyRoot)) {
+                if (-not (Test-DXUnderPath $d $LegacyRoot) -or -not (Test-Path -LiteralPath $d)) { continue }
+                $left = @(Get-ChildItem -LiteralPath $d -Force)
+                if ($left.Count -eq 0) { Remove-Item -LiteralPath $d -Force; Log "removed empty folder $d" }
+                else { Log "kept $d (still holds: $(@($left | Select-Object -First 5 | ForEach-Object Name) -join ', '))" }
+            }
+        } catch { Log "old C:\DX cleanup incomplete: $($_.Exception.Message)" 'WARN' }
     }
 
     # Migration: remove the pre-rename task \BCT\BCT Checkmk Agent Update if present (respects -DryRun).
@@ -305,10 +478,23 @@ param(
         throw "CheckMkService not running after install (status $($svc.Status))"
     }
 
+    # Expose helpers for unit tests (test-only, never used in normal runs).
+    if ($env:CMK_TEST_EXPORT_FUNCTIONS -eq '1') {
+        foreach ($fn in @('ConvertTo-CmkVersion', 'Compare-CmkVersion', 'Log', 'Get-ScriptText', 'Install-Task', 'Invoke-OldTaskCleanup',
+                          'ConvertTo-DXNormPath', 'Test-DXSamePath', 'Test-DXUnderPath', 'Test-DXTextHasPath', 'Resolve-DXPath',
+                          'Protect-DXFolder', 'Initialize-DXFolder', 'Get-DXTaskAction', 'Get-DXLegacyLocation', 'Get-DXOwnedLog',
+                          'Copy-DXLegacyLog', 'Invoke-DXLegacyCleanup')) {
+            Set-Item -Path "function:global:$fn" -Value (Get-Item -Path "function:$fn").ScriptBlock
+        }
+        return
+    }
+
     # ================= main =================
     $tmp = $null
     try {
         $testMode = $false
+        $ScriptDir = Resolve-DXPath $ScriptDir ([IO.Path]::Combine($DxRoot, 'Scripts'))
+        $LogDir    = Resolve-DXPath $LogDir ([IO.Path]::Combine($DxRoot, 'Logs'))
         # ----- resolve settings: parameter > CMK_* env var > default -----
         if (-not $BaseUrl)       { $BaseUrl = $env:CMK_BASEURL }
         if (-not $BaseUrl)       { $BaseUrl = 'https://mon.ausict.com/dx' }
@@ -323,7 +509,8 @@ param(
         if ($DryRun -and (EnvFlag 'CMK_TEST_SKIP_ADMIN')) { $testMode = $true }   # test-only, DryRun only
 
         if (-not $testMode) {
-            New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+            # C:\Windows\... needs admin; a failure here must not hide the clearer 'run elevated' message below.
+            try { Initialize-DXFolder $LogDir } catch { Log "log folder ${LogDir}: $($_.Exception.Message)" 'WARN' }
             $tlog = Join-Path $LogDir ('Update-CheckmkAgent-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
             try { Start-Transcript -Path $tlog -Force | Out-Null; $state.TranscriptOn = $true } catch { Log "transcript not started: $($_.Exception.Message)" 'WARN' }
 
@@ -408,7 +595,7 @@ param(
             New-Item -Path $tmp -ItemType Directory -Force | Out-Null
             $msi = Save-Msi $MsiUrl $tmp
         }
-        New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+        Initialize-DXFolder $LogDir
         $msiLog = Join-Path $LogDir ('CheckmkAgent-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
         Log "installing ($why): msiexec /i /qn /norestart, log $msiLog"
         $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
